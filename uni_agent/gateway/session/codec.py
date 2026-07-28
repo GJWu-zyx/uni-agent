@@ -15,6 +15,12 @@ from uuid import uuid4
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tokenizer.chat_template import apply_chat_template as _apply_chat_template
 from verl.utils.tokenizer.chat_template import initialize_system_prompt, initialize_turn_separator
+from verl.utils.tokenizer.continuous_token import MergeResult
+from verl.utils.tokenizer.continuous_token_wiring import (
+    ContinuousTokenModelFamily,
+    create_continuous_token_builder,
+    resolve_continuous_token_model_family,
+)
 
 logger = logging.getLogger("gateway")
 
@@ -80,9 +86,10 @@ def _process_tool_calls_vllm(
     from vllm.tool_parsers import ToolParserManager
 
     parser_cls = ToolParserManager.get_tool_parser(parser_name)
-    parser = parser_cls(tokenizer)
+    vllm_tools = [ChatCompletionToolsParam(**tool) if isinstance(tool, dict) else tool for tool in tools]
+    parser = parser_cls(tokenizer, tools=vllm_tools)
     request = SimpleNamespace(
-        tools=[ChatCompletionToolsParam(**tool) if isinstance(tool, dict) else tool for tool in tools],
+        tools=vllm_tools,
         tool_choice="auto",
         skip_special_tokens=True,
     )
@@ -150,6 +157,24 @@ class MessageCodec:
             processing_class,
             **self._apply_chat_template_kwargs,
         )
+        self._continuous_token_builder = None
+        tokenizer_name_or_path = getattr(tokenizer, "name_or_path", None)
+        if tokenizer_name_or_path is None:
+            tokenizer_init_kwargs = getattr(tokenizer, "init_kwargs", None) or {}
+            tokenizer_name_or_path = tokenizer_init_kwargs.get("name_or_path")
+        if self._processor is None and tokenizer_name_or_path:
+            continuous_token_family = resolve_continuous_token_model_family(
+                ContinuousTokenModelFamily.AUTO,
+                tokenizer=tokenizer,
+                tokenizer_name_or_path=str(tokenizer_name_or_path),
+            )
+            if continuous_token_family != ContinuousTokenModelFamily.DEFAULT:
+                self._continuous_token_builder = create_continuous_token_builder(
+                    tokenizer,
+                    model_family=continuous_token_family,
+                    tokenizer_name_or_path=str(tokenizer_name_or_path),
+                    chat_template_kwargs=self._apply_chat_template_kwargs,
+                )
         self._tool_parser_name = tool_parser_name
 
     async def _default_vision_info_extractor(
@@ -282,6 +307,83 @@ class MessageCodec:
                 )
             )
         return self._turn_separator + ids[len(self._system_prompt) :]
+
+    def merge_incremental(
+        self,
+        previous_messages: list[dict[str, Any]],
+        incremental_messages: list[dict[str, Any]],
+        runtime_token_ids: list[int],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        image_data: list[Any] | None = None,
+        video_data: list[Any] | None = None,
+    ) -> MergeResult:
+        """Merge continuation messages into the exact runtime token stream."""
+        builder = self._continuous_token_builder
+        if (
+            builder is not None
+            and previous_messages
+            and previous_messages[-1].get("role") == "assistant"
+            and all(message.get("role") in builder.allowed_append_roles for message in incremental_messages)
+        ):
+            previous_for_template = self._normalize_messages_for_continuous_token(previous_messages)
+            incremental_for_template = self._normalize_messages_for_continuous_token(incremental_messages)
+            return builder.merge_non_assistant_tokens(
+                previous_for_template,
+                previous_for_template + incremental_for_template,
+                runtime_token_ids,
+                tools=tools,
+            )
+
+        incremental_ids = self.encode_incremental(
+            incremental_messages,
+            image_data=image_data,
+            video_data=video_data,
+        )
+        return MergeResult(
+            token_ids=list(runtime_token_ids) + incremental_ids,
+            appended_token_count=len(incremental_ids),
+            kind="non_assistant",
+        )
+
+    @staticmethod
+    def _normalize_messages_for_continuous_token(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Adapt OpenAI JSON-string arguments for HF chat-template rendering."""
+        normalized_messages: list[dict[str, Any]] = []
+        for message in messages:
+            normalized_message = dict(message)
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                normalized_messages.append(normalized_message)
+                continue
+
+            normalized_tool_calls = []
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    normalized_tool_calls.append(tool_call)
+                    continue
+                normalized_tool_call = dict(tool_call)
+                function = tool_call.get("function")
+                argument_owner = dict(function) if isinstance(function, dict) else normalized_tool_call
+                arguments = argument_owner.get("arguments")
+                if "arguments" in argument_owner:
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except json.JSONDecodeError:
+                            arguments = {}
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    argument_owner["arguments"] = arguments
+                if isinstance(function, dict):
+                    normalized_tool_call["function"] = argument_owner
+                normalized_tool_calls.append(normalized_tool_call)
+
+            normalized_message["tool_calls"] = normalized_tool_calls
+            normalized_messages.append(normalized_message)
+        return normalized_messages
 
     async def decode_response(
         self,

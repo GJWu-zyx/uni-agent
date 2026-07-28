@@ -15,7 +15,6 @@ waiter the instant it finishes.
 
 from __future__ import annotations
 
-import base64
 import dataclasses
 import re
 import shlex
@@ -47,11 +46,10 @@ class CommandResult:
         return self.end_time - self.start_time
 
 
-def _capture_wrapper(command: str, out: str, err: str, rc: str, *, signal: str | None, sock: str) -> str:
-    """Build the shell line running ``command`` under the file-capture protocol."""
-    b64 = base64.b64encode(command.encode()).decode("ascii")
+def _capture_wrapper(command_path: str, out: str, err: str, rc: str, *, signal: str | None, sock: str) -> str:
+    """Build the shell line loading ``command_path`` under the file-capture protocol."""
     line = (
-        f"eval \"$(printf %s '{b64}' | base64 -d)\" "
+        f'eval "$(cat {shlex.quote(command_path)})" '
         f"> {shlex.quote(out)} 2> {shlex.quote(err)}; "
         f'__rc=$?; printf %s "$__rc" > {shlex.quote(rc)}.part '
         f"&& mv {shlex.quote(rc)}.part {shlex.quote(rc)}"
@@ -171,9 +169,12 @@ class ShellChannel:
         cid = self._counter + 1
         self._counter = cid
         out, err, rc = self._paths(cid)
-        line = _capture_wrapper(command, out, err, rc, signal=self._chan(cid), sock=self._sock)
-        # Type the wrapped line then press Enter. `--` ends option parsing so a
-        # command starting with `-` is still typed literally.
+        command_path = f"{self._dir}/cmd_{cid}.input"
+        # Keep arbitrary-size command text out of tmux's command argv: tmux
+        # rejects an oversized `send-keys` argument before it reaches the pane.
+        await self.backend.write_file(command_path, command)
+        line = _capture_wrapper(command_path, out, err, rc, signal=self._chan(cid), sock=self._sock)
+        # Type the short wrapper then press Enter.
         res = await self.backend.exec(
             self._tmux("send-keys", "-t", self.session_id, "--", line, "Enter")
         )

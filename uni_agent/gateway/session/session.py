@@ -14,6 +14,7 @@ from fastapi import HTTPException
 
 from uni_agent.gateway.session.codec import MessageCodec
 from uni_agent.gateway.session.types import InternalGenerationRequest, SessionHandle, Trajectory
+from verl.utils.tokenizer.continuous_token import MergeResult
 
 _EMPTY_PREFIX_HASH = hashlib.sha256(b"uni-agent-prefix-v1\0empty").hexdigest()
 
@@ -418,22 +419,29 @@ class GatewaySession:
                 assert last_assistant_start.video_data_len <= len(stored_video_data)
                 image_data = stored_image_data[: last_assistant_start.image_data_len] or None
                 video_data = stored_video_data[: last_assistant_start.video_data_len] or None
+                previous_messages = messages[: last_assistant_start.message_history_len]
                 suffix_messages = messages[last_assistant_start.message_history_len :]
-                suffix_ids: list[int] = []
                 new_image_data = None
                 new_video_data = None
                 if suffix_messages:
                     new_image_data, new_video_data = await self._codec.extract_multi_modal_data(suffix_messages)
-                    suffix_ids = self._codec.encode_incremental(
+                    merge_result = self._codec.merge_incremental(
+                        previous_messages,
                         suffix_messages,
+                        buffer.prompt_ids + buffer.response_ids,
+                        tools=tools,
                         image_data=new_image_data,
                         video_data=new_video_data,
                     )
-
-                buffer.response_ids.extend(suffix_ids)
-                buffer.response_mask.extend([0] * len(suffix_ids))
-                if sampling_params.get("logprobs", False):
-                    buffer.response_logprobs.extend([0.0] * len(suffix_ids))
+                    (
+                        buffer.response_ids,
+                        buffer.response_mask,
+                        buffer.response_logprobs,
+                    ) = self._align_incremental_merge(
+                        buffer,
+                        merge_result,
+                        track_logprobs=bool(buffer.response_logprobs) or sampling_params.get("logprobs", False),
+                    )
                 self._assert_response_logprob_alignment(buffer)
                 if new_image_data:
                     if image_data is None:
@@ -476,21 +484,30 @@ class GatewaySession:
                 incremental_messages = messages[len(selected_chain.message_history) :]
                 new_image_data = None
                 new_video_data = None
-                incremental_ids = []
+                merged_response_data: tuple[list[int], list[int], list[float]] | None = None
                 already_exhausted = (
                     self._response_length is not None and len(buffer.response_mask) >= self._response_length
                 )
                 if incremental_messages and not already_exhausted:
                     new_image_data, new_video_data = await self._codec.extract_multi_modal_data(incremental_messages)
-                    incremental_ids = self._codec.encode_incremental(
+                    merge_result = self._codec.merge_incremental(
+                        selected_chain.message_history,
                         incremental_messages,
+                        buffer.prompt_ids + buffer.response_ids,
+                        tools=tools,
                         image_data=new_image_data,
                         video_data=new_video_data,
+                    )
+                    merged_response_data = self._align_incremental_merge(
+                        buffer,
+                        merge_result,
+                        track_logprobs=bool(buffer.response_logprobs) or sampling_params.get("logprobs", False),
                     )
 
                 if already_exhausted or (
                     self._response_length is not None
-                    and len(buffer.response_mask) + len(incremental_ids) >= self._response_length
+                    and merged_response_data is not None
+                    and len(merged_response_data[1]) >= self._response_length
                 ):
                     context_ids = buffer.prompt_ids + buffer.response_ids
                     return EncodedData(
@@ -509,10 +526,12 @@ class GatewaySession:
                         incoming_message_prefix_hashes=list(incoming_message_prefix_hashes),
                     )
 
-                buffer.response_ids.extend(incremental_ids)
-                buffer.response_mask.extend([0] * len(incremental_ids))
-                if sampling_params.get("logprobs", False):
-                    buffer.response_logprobs.extend([0.0] * len(incremental_ids))
+                if merged_response_data is not None:
+                    (
+                        buffer.response_ids,
+                        buffer.response_mask,
+                        buffer.response_logprobs,
+                    ) = merged_response_data
                 self._assert_response_logprob_alignment(buffer)
                 if new_image_data:
                     if image_data is None:
@@ -671,6 +690,52 @@ class GatewaySession:
             0,
             len(buffer.response_ids),
         }, "response_logprobs must be empty or aligned with response_ids"
+
+    @staticmethod
+    def _align_incremental_merge(
+        buffer: TrajectoryBuffer,
+        merge_result: MergeResult,
+        *,
+        track_logprobs: bool,
+    ) -> tuple[list[int], list[int], list[float]]:
+        """Project a Continuous Token merge back onto response-side metadata."""
+        if merge_result.kind != "non_assistant":
+            raise RuntimeError(f"incremental message merge returned unexpected kind {merge_result.kind!r}")
+
+        removed_count = merge_result.removed_prefix_token_count
+        if removed_count > len(buffer.response_ids):
+            raise RuntimeError("incremental merge attempted to remove initial prompt tokens")
+        retained_response_ids = buffer.response_ids[:-removed_count] if removed_count else list(buffer.response_ids)
+        retained_runtime_ids = buffer.prompt_ids + retained_response_ids
+        if merge_result.token_ids[: len(retained_runtime_ids)] != retained_runtime_ids:
+            raise RuntimeError("incremental merge changed tokens before the continuation boundary")
+
+        appended_count = len(merge_result.inserted_token_ids) + merge_result.appended_token_count
+        if len(merge_result.token_ids) != len(retained_runtime_ids) + appended_count:
+            raise RuntimeError("incremental merge token accounting is inconsistent")
+
+        response_ids = list(merge_result.token_ids[len(buffer.prompt_ids) :])
+        response_mask = list(buffer.response_mask)
+        if removed_count:
+            del response_mask[-removed_count:]
+        response_mask.extend([0] * appended_count)
+
+        if buffer.response_logprobs:
+            response_logprobs = list(buffer.response_logprobs)
+        elif track_logprobs:
+            response_logprobs = [0.0] * len(buffer.response_ids)
+        else:
+            response_logprobs = []
+        if track_logprobs:
+            if removed_count:
+                del response_logprobs[-removed_count:]
+            response_logprobs.extend([0.0] * appended_count)
+
+        if len(response_ids) != len(response_mask):
+            raise RuntimeError("incremental merge response IDs and mask are misaligned")
+        if response_logprobs and len(response_ids) != len(response_logprobs):
+            raise RuntimeError("incremental merge response IDs and logprobs are misaligned")
+        return response_ids, response_mask, response_logprobs
 
     def _snapshot_last_assistant_start(
         self,
