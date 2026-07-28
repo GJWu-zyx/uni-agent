@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tokenizer.chat_template import apply_chat_template as _apply_chat_template
-from verl.utils.tokenizer.chat_template import initialize_system_prompt
+from verl.utils.tokenizer.chat_template import initialize_system_prompt, initialize_turn_separator
 
 logger = logging.getLogger("gateway")
 
@@ -141,8 +141,13 @@ class MessageCodec:
         self._vision_info_extractor = vision_info_extractor or self._default_vision_info_extractor
         self._vision_info_extractor_kwargs = dict(vision_info_extractor_kwargs or {})
         self._apply_chat_template_kwargs = dict(apply_chat_template_kwargs or {})
+        processing_class = self._processor if self._processor is not None else tokenizer
         self._system_prompt = initialize_system_prompt(
-            self._processor if self._processor is not None else tokenizer,
+            processing_class,
+            **self._apply_chat_template_kwargs,
+        )
+        self._turn_separator = initialize_turn_separator(
+            processing_class,
             **self._apply_chat_template_kwargs,
         )
         self._tool_parser_name = tool_parser_name
@@ -276,7 +281,7 @@ class MessageCodec:
                     **self._apply_chat_template_kwargs,
                 )
             )
-        return ids[len(self._system_prompt) :]
+        return self._turn_separator + ids[len(self._system_prompt) :]
 
     async def decode_response(
         self,

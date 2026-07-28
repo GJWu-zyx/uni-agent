@@ -28,8 +28,8 @@ class ReActConfig(AgentConfig):
     name: str = "react"
     tools: list[dict] = Field(
         default_factory=lambda: [
-            {"name": "stateful_shell", "command_timeout": 120},
             {"name": "str_replace_editor"},
+            {"name": "stateful_shell", "command_timeout": 120},
             {"name": "submit"},
         ],
         description="Host-side tools exposed to the policy (each a {name, ...kwargs} entry). "
