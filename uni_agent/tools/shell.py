@@ -271,7 +271,7 @@ class TmuxShell:
     async def run(self, command: str, *, timeout: float = 120.0) -> CommandResult:
         start = time.monotonic()
         cid = await self.start_command(command)
-        out, err, rc = self._paths(cid)
+        out, err, _ = self._paths(cid)
         chan = self._chan(cid)
         timed_out = False
         code: int | None = None
@@ -282,9 +282,8 @@ class TmuxShell:
                 break
             elapsed = time.monotonic() - start
             if elapsed >= timeout:
-                await self.interrupt()
-                code = await self.poll(cid)
-                timed_out = code is None
+                timed_out = True
+                code = await self.interrupt(cid)
                 break
             # Event-driven wakeup: block on the command's tmux wait channel to
             # return the instant it signals. poll() stays the source of truth, so a
@@ -315,10 +314,22 @@ class TmuxShell:
         if res.exit_code != 0:
             raise RuntimeError(f"send_keys failed: {res.stderr.strip()}")
 
-    async def interrupt(self) -> None:
-        await self.backend.exec(
-            self._tmux("send-keys", "-t", self.session_id, "C-c")
-        )
+    async def interrupt(self, command_id: int | None = None) -> int | None:
+        """Send Ctrl-C, then suspend and kill the current job if it stays alive."""
+        await self.send_keys("C-c")
+        if command_id is None:
+            return None
+
+        await asyncio.sleep(2)
+        code = await self.poll(command_id)
+        if code is not None:
+            return code
+
+        await self.send_keys("C-z")
+        await asyncio.sleep(2)
+        await self.send_keys(["kill -KILL %+", "Enter"])
+        await asyncio.sleep(1)
+        return await self.poll(command_id)
 
     async def capture_pane(self, *, entire: bool = False) -> str:
         args = self._tmux("capture-pane", "-p")

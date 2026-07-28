@@ -21,15 +21,12 @@ logger = logging.getLogger(__name__)
 #: Tool names that end the episode when the policy calls them.
 _FINISH_TOOLS = {"submit", "finish"}
 
-_NO_TOOL_CALL_RETRY = (
-    "No tool call found in your previous response. Use one of the available tools to continue. "
-    "When the task is complete, call the submit or finish tool."
-)
 
-
-def _has_configured_finish_tool(cfg: ReActConfig) -> bool:
-    """Whether this episode requires an explicit submit/finish call."""
-    return any(spec.get("name") in _FINISH_TOOLS for spec in cfg.tools)
+def _no_tool_call_retry(cfg: ReActConfig) -> str:
+    """Build retry guidance naming only the configured finish tools."""
+    finish_tools = list(dict.fromkeys(str(spec["name"]) for spec in cfg.tools if spec.get("name") in _FINISH_TOOLS))
+    finish_instruction = " or ".join(finish_tools)
+    return f"No tool call found. Call an available tool to continue, or call {finish_instruction} when done."
 
 
 class ReActConfig(AgentConfig):
@@ -166,10 +163,11 @@ class ReActAgent(Agent):
             return "token_limit"
 
         if not tool_calls:
-            if _has_configured_finish_tool(cfg):
+            if any(spec.get("name") in _FINISH_TOOLS for spec in cfg.tools):
                 info["format_errors"] += 1
-                transcript.append({"role": "user", "content": _NO_TOOL_CALL_RETRY})
-                logger.warning("No tool call found; asking the policy to retry with an explicit tool call.")
+                no_tool_call_retry = _no_tool_call_retry(cfg)
+                transcript.append({"role": "user", "content": no_tool_call_retry})
+                logger.warning("No tool call found; asking the policy to retry:\n%s", no_tool_call_retry)
                 return "completed"
             else:
                 logger.info("💬 FINISHED: policy replied with plain text (no tool call).")
@@ -191,7 +189,7 @@ class ReActAgent(Agent):
                 )
             elif tool_result.status != "ok":
                 info["errors"] += 1
-                logger.error(f"❌ TOOL {tool_result.status.upper()} ({name}):\n{observation}")
+                logger.warning(f"❌ TOOL {tool_result.status.upper()} ({name}):\n{observation}")
             else:
                 logger.info(f"👀 OBSERVATION ({name}):\n{observation}")
 

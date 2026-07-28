@@ -176,9 +176,17 @@ async def test_total_tokens_tracks_current_context_size():
 
 
 @pytest.mark.asyncio
-async def test_plain_text_retries_when_finish_tool_is_configured():
+@pytest.mark.parametrize(
+    ("finish_tools", "expected_instruction"),
+    [
+        (["submit"], "or call submit when done."),
+        (["finish"], "or call finish when done."),
+        (["submit", "finish"], "or call submit or finish when done."),
+    ],
+)
+async def test_plain_text_retries_when_finish_tool_is_configured(finish_tools, expected_instruction):
     model = ModelConfig(base_url="http://gateway:8000/v1", model_name="policy")
-    agent = ReActAgent(ReActConfig(model=model, tools=[{"name": "submit"}], max_steps=2))
+    agent = ReActAgent(ReActConfig(model=model, tools=[{"name": name} for name in finish_tools], max_steps=2))
     cfg: ReActConfig = agent.config  # type: ignore[assignment]
     transcript: list[dict] = []
     info = _step_info()
@@ -189,7 +197,7 @@ async def test_plain_text_retries_when_finish_tool_is_configured():
     assert info["format_errors"] == 1
     assert [message["role"] for message in transcript] == ["assistant", "user"]
     assert "No tool call found" in transcript[-1]["content"]
-    assert "submit or finish" in transcript[-1]["content"]
+    assert expected_instruction in transcript[-1]["content"]
 
 
 @pytest.mark.asyncio
