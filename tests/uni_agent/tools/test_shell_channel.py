@@ -3,7 +3,7 @@ from typing import Any
 import pytest
 
 from uni_agent.sandbox import ExecResult
-from uni_agent.tools.shell import ShellChannel
+from uni_agent.tools.shell import TmuxShell
 
 
 class RecordingBackend:
@@ -22,7 +22,7 @@ class RecordingBackend:
 @pytest.mark.asyncio
 async def test_start_command_keeps_large_payload_out_of_tmux_argv():
     backend = RecordingBackend()
-    channel = ShellChannel(backend, session_id="test-session")  # type: ignore[arg-type]
+    channel = TmuxShell(backend, session_id="test-session")  # type: ignore[arg-type]
     command = "printf 'large payload\\n'\n" * 10_000
 
     command_id = await channel.start_command(command)
