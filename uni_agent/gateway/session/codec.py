@@ -15,7 +15,7 @@ from uuid import uuid4
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tokenizer.chat_template import apply_chat_template as _apply_chat_template
 from verl.utils.tokenizer.chat_template import initialize_system_prompt, initialize_turn_separator
-from verl.utils.tokenizer.continuous_token import MergeResult
+from verl.utils.tokenizer.continuous_token import ContinuousTokenBuilder, MergeResult
 from verl.utils.tokenizer.continuous_token_wiring import (
     ContinuousTokenModelFamily,
     create_continuous_token_builder,
@@ -175,6 +175,7 @@ class MessageCodec:
                     tokenizer_name_or_path=str(tokenizer_name_or_path),
                     chat_template_kwargs=self._apply_chat_template_kwargs,
                 )
+        self._metadata_aligner = self._continuous_token_builder or ContinuousTokenBuilder(tokenizer)
         self._tool_parser_name = tool_parser_name
 
     async def _default_vision_info_extractor(
@@ -313,12 +314,14 @@ class MessageCodec:
         previous_messages: list[dict[str, Any]],
         incremental_messages: list[dict[str, Any]],
         runtime_token_ids: list[int],
+        response_mask: list[int],
+        response_logprobs: list[float] | None = None,
         *,
         tools: list[dict[str, Any]] | None = None,
         image_data: list[Any] | None = None,
         video_data: list[Any] | None = None,
-    ) -> MergeResult:
-        """Merge continuation messages into the exact runtime token stream."""
+    ) -> tuple[MergeResult, list[int], list[float] | None]:
+        """Merge continuation messages and align their response metadata."""
         builder = self._continuous_token_builder
         if (
             builder is not None
@@ -328,23 +331,30 @@ class MessageCodec:
         ):
             previous_for_template = self._normalize_messages_for_continuous_token(previous_messages)
             incremental_for_template = self._normalize_messages_for_continuous_token(incremental_messages)
-            return builder.merge_non_assistant_tokens(
+            merge_result = builder.merge_non_assistant_tokens(
                 previous_for_template,
                 previous_for_template + incremental_for_template,
                 runtime_token_ids,
                 tools=tools,
             )
+        else:
+            incremental_ids = self.encode_incremental(
+                incremental_messages,
+                image_data=image_data,
+                video_data=video_data,
+            )
+            merge_result = MergeResult(
+                token_ids=list(runtime_token_ids) + incremental_ids,
+                appended_token_count=len(incremental_ids),
+                kind="non_assistant",
+            )
 
-        incremental_ids = self.encode_incremental(
-            incremental_messages,
-            image_data=image_data,
-            video_data=video_data,
+        aligned_response_mask, aligned_response_logprobs = self._metadata_aligner.align_response_metadata(
+            merge_result,
+            response_mask,
+            response_logprobs,
         )
-        return MergeResult(
-            token_ids=list(runtime_token_ids) + incremental_ids,
-            appended_token_count=len(incremental_ids),
-            kind="non_assistant",
-        )
+        return merge_result, aligned_response_mask, aligned_response_logprobs
 
     @staticmethod
     def _normalize_messages_for_continuous_token(

@@ -4,8 +4,6 @@ import pytest
 import torch
 
 from uni_agent.gateway.session.codec import MessageCodec
-from uni_agent.gateway.session.session import GatewaySession, TrajectoryBuffer
-from verl.utils.tokenizer.continuous_token import MergeResult
 
 TOOLS = [
     {
@@ -179,17 +177,76 @@ def test_continuous_token_merge_matches_full_qwen_template(
     )
     runtime_ids = prefix_ids[: -len(codec._turn_separator)]
 
-    result = codec.merge_incremental(
+    result, response_mask, response_logprobs = codec.merge_incremental(
         [user, assistant_api],
         [tool],
         runtime_ids,
+        [1],
+        [-0.2],
         tools=TOOLS,
     )
 
     assert result.token_ids == expected_ids
     assert result.inserted_token_ids == tokenizer.encode("\n")
+    appended_count = len(result.inserted_token_ids) + result.appended_token_count
+    assert response_mask == [1] + [0] * appended_count
+    assert response_logprobs == [-0.2] + [0.0] * appended_count
     appended_text = tokenizer.decode(result.token_ids[len(runtime_ids) :])
     assert appended_text.startswith("\n<|im_start|>user\n<tool_response>\nObservation:\nresult")
+
+
+@pytest.mark.parametrize(
+    ("model_name", "requires_user", "thinking_prompt"),
+    [
+        ("Qwen/Qwen3-Coder-30B-A3B-Instruct", False, False),
+        ("Qwen/Qwen3.5-4B", True, True),
+    ],
+)
+def test_continuous_token_user_merge_preserves_runtime_and_appends_qwen_turn(
+    model_name,
+    requires_user,
+    thinking_prompt,
+):
+    tokenizer = _QwenTemplateTokenizer(
+        model_name,
+        requires_user=requires_user,
+        thinking_prompt=thinking_prompt,
+    )
+    codec = MessageCodec(tokenizer)
+    previous_messages = [
+        {"role": "user", "content": "Task"},
+        {"role": "assistant", "content": "Previous response."},
+    ]
+    retry_message = {"role": "user", "content": "No tool call found. Please retry."}
+    runtime_ids = tokenizer.apply_chat_template(
+        [previous_messages[0]],
+        tools=TOOLS,
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+    assistant_completion = (
+        "\n</think>\n\nPrevious response.<|im_end|>" if thinking_prompt else "Previous response.<|im_end|>"
+    )
+    runtime_ids += tokenizer.encode(assistant_completion, add_special_tokens=False)
+    expected_append = "\n<|im_start|>user\nNo tool call found. Please retry.<|im_end|>\n<|im_start|>assistant\n" + (
+        "<think>\n" if thinking_prompt else ""
+    )
+
+    result, response_mask, response_logprobs = codec.merge_incremental(
+        previous_messages,
+        [retry_message],
+        runtime_ids,
+        [1],
+        [-0.2],
+        tools=TOOLS,
+    )
+
+    assert result.token_ids == runtime_ids + tokenizer.encode(expected_append, add_special_tokens=False)
+    appended_count = len(result.inserted_token_ids) + result.appended_token_count
+    assert response_mask == [1] + [0] * appended_count
+    assert response_logprobs == [-0.2] + [0.0] * appended_count
+    appended_text = tokenizer.decode(result.token_ids[len(runtime_ids) :])
+    assert appended_text == expected_append
 
 
 def test_qwen35_processor_fallback_also_matches_full_template():
@@ -215,37 +272,15 @@ def test_qwen35_processor_fallback_also_matches_full_template():
     )
     runtime_ids = prefix_ids[: -len(codec._turn_separator)]
 
-    result = codec.merge_incremental(
+    result, response_mask, response_logprobs = codec.merge_incremental(
         previous_messages,
         [tool],
         runtime_ids,
+        [1],
         tools=TOOLS,
     )
 
     assert codec._continuous_token_builder is None
     assert result.token_ids == expected_ids
-
-
-def test_gateway_aligns_continuous_token_wrapper_metadata():
-    buffer = TrajectoryBuffer(
-        prompt_ids=[1, 2],
-        response_ids=[3],
-        response_mask=[1],
-        response_logprobs=[-0.2],
-    )
-    result = MergeResult(
-        token_ids=[1, 2, 3, 10, 11, 12],
-        inserted_token_ids=[10],
-        appended_token_count=2,
-        kind="non_assistant",
-    )
-
-    response_ids, response_mask, response_logprobs = GatewaySession._align_incremental_merge(
-        buffer,
-        result,
-        track_logprobs=True,
-    )
-
-    assert response_ids == [3, 10, 11, 12]
-    assert response_mask == [1, 0, 0, 0]
-    assert response_logprobs == [-0.2, 0.0, 0.0, 0.0]
+    assert response_mask == [1] + [0] * result.appended_token_count
+    assert response_logprobs is None
