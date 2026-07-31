@@ -290,8 +290,11 @@ class MessageCodec:
             )
             if not full_prompt.startswith(anchor_prompt):
                 raise ValueError("Assistant incremental chat template is not prefix-stable")
+            # Tokenize only the new text so boundary tokens already in the runtime are not merged.
             return self._encode_prompt_text(
-                full_prompt[len(anchor_prompt) :], image_data, video_data,
+                full_prompt[len(anchor_prompt) :],
+                image_data,
+                video_data,
             )
         elif first_role in ["user", "tool"]:
             # TODO: Replace this user/tool empty-user fallback with continuous-token merging.

@@ -394,6 +394,8 @@ def test_incremental_assistant_tool_encode_continues_generation_prompt(
     assert tokenizer.decode(result_ids) == expected_text
     assert not tokenizer.decode(incremental_ids).startswith("\n<|im_start|>assistant")
     if thinking_prompt:
+        newline_id = tokenizer.encode("\n", add_special_tokens=False)[0]
+        assert result_ids[len(runtime_ids) - 1 : len(runtime_ids) + 1] == [newline_id, newline_id]
         assert result_ids != expected_ids
     else:
         assert result_ids == expected_ids
