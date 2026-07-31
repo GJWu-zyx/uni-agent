@@ -75,7 +75,6 @@ def _step_info(*, total_tokens: int = 0) -> dict:
         "num_tool_calls": 0,
         "timeouts": 0,
         "errors": 0,
-        "format_errors": 0,
         "total_tokens": total_tokens,
     }
 
@@ -176,28 +175,15 @@ async def test_total_tokens_tracks_current_context_size():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("finish_tools", "expected_instruction"),
-    [
-        (["submit"], "or call submit when done."),
-        (["finish"], "or call finish when done."),
-        (["submit", "finish"], "or call submit or finish when done."),
-    ],
-)
-async def test_plain_text_retries_when_finish_tool_is_configured(finish_tools, expected_instruction):
-    model = ModelConfig(base_url="http://gateway:8000/v1", model_name="policy")
-    agent = ReActAgent(ReActConfig(model=model, tools=[{"name": name} for name in finish_tools], max_steps=2))
+async def test_plain_text_without_tool_call_finishes_episode():
+    agent = _agent()
     cfg: ReActConfig = agent.config  # type: ignore[assignment]
     transcript: list[dict] = []
-    info = _step_info()
 
-    reason = await agent.step(cfg, _StepModel(), _StepToolbox(), transcript, info)
+    reason = await agent.step(cfg, _StepModel(), _StepToolbox(), transcript, _step_info())
 
-    assert reason == "completed"
-    assert info["format_errors"] == 1
-    assert [message["role"] for message in transcript] == ["assistant", "user"]
-    assert "No tool call found" in transcript[-1]["content"]
-    assert expected_instruction in transcript[-1]["content"]
+    assert reason == "finished"
+    assert [message["role"] for message in transcript] == ["assistant"]
 
 
 @pytest.mark.asyncio

@@ -22,13 +22,6 @@ logger = logging.getLogger(__name__)
 _FINISH_TOOLS = {"submit", "finish"}
 
 
-def _no_tool_call_retry(cfg: ReActConfig) -> str:
-    """Build retry guidance naming only the configured finish tools."""
-    finish_tools = list(dict.fromkeys(str(spec["name"]) for spec in cfg.tools if spec.get("name") in _FINISH_TOOLS))
-    finish_instruction = " or ".join(finish_tools)
-    return f"No tool call found. Call an available tool to continue, or call {finish_instruction} when done."
-
-
 class ReActConfig(AgentConfig):
     """White-box launch params: host-side tools + step / timeout budgets."""
 
@@ -87,7 +80,6 @@ class ReActAgent(Agent):
             "num_tool_calls": 0,
             "timeouts": 0,
             "errors": 0,
-            "format_errors": 0,
             "total_tokens": 0,
         }
         termination_reason = "unknown"
@@ -112,8 +104,7 @@ class ReActAgent(Agent):
         logger.info(
             f"Episode done: termination_reason={termination_reason} steps={trajectory_info['steps']} "
             f"tool_calls={trajectory_info['num_tool_calls']} timeouts={trajectory_info['timeouts']} "
-            f"errors={trajectory_info['errors']} format_errors={trajectory_info['format_errors']} "
-            f"total_tokens={trajectory_info['total_tokens']}"
+            f"errors={trajectory_info['errors']} total_tokens={trajectory_info['total_tokens']}"
         )
         return AgentResult(transcript=transcript, info=trajectory_info, finished=termination_reason == "finished")
 
@@ -163,15 +154,8 @@ class ReActAgent(Agent):
             return "token_limit"
 
         if not tool_calls:
-            if any(spec.get("name") in _FINISH_TOOLS for spec in cfg.tools):
-                info["format_errors"] += 1
-                no_tool_call_retry = _no_tool_call_retry(cfg)
-                transcript.append({"role": "user", "content": no_tool_call_retry})
-                logger.warning("No tool call found; asking the policy to retry:\n%s", no_tool_call_retry)
-                return "completed"
-            else:
-                logger.info("💬 FINISHED: policy replied with plain text (no tool call).")
-                return "finished"
+            logger.info("💬 FINISHED: policy replied with plain text (no tool call).")
+            return "finished"
 
         # step 2: dispatch the tool calls
         saw_finish = False
