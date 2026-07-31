@@ -421,49 +421,35 @@ class GatewaySession:
                     assert last_assistant_start.video_data_len <= len(video_data)
                     video_data = video_data[: last_assistant_start.video_data_len] or None
                 incremental_start = last_assistant_start.message_history_len
-                previous_messages = messages[:incremental_start]
                 rollback_applied = True
             else:
                 incremental_start = len(selected_chain.message_history)
-                previous_messages = selected_chain.message_history
 
             incremental_messages = messages[incremental_start:]
             new_image_data = None
             new_video_data = None
-            merged_response_data: tuple[list[int], list[int], list[float]] | None = None
+            incremental_ids = []
             current_trajectory_length = len(buffer.prompt_ids) + len(buffer.response_ids)
             capacity_exhausted = (
                 self._trajectory_capacity is not None and current_trajectory_length >= self._trajectory_capacity
             )
             if incremental_messages and not capacity_exhausted:
                 new_image_data, new_video_data = await self._codec.extract_multi_modal_data(incremental_messages)
-                merge_result, response_mask, response_logprobs = self._codec.merge_incremental(
-                    previous_messages,
+                incremental_ids = self._codec.encode_incremental(
                     incremental_messages,
-                    buffer.prompt_ids + buffer.response_ids,
-                    buffer.response_mask,
-                    buffer.response_logprobs
-                    if buffer.response_logprobs or sampling_params.get("logprobs", False)
-                    else None,
-                    tools=tools,
                     image_data=new_image_data,
                     video_data=new_video_data,
                 )
-                merged_response_data = (
-                    list(merge_result.token_ids[len(buffer.prompt_ids) :]),
-                    response_mask,
-                    response_logprobs or [],
-                )
                 capacity_exhausted = (
-                    self._trajectory_capacity is not None and len(merge_result.token_ids) >= self._trajectory_capacity
+                    self._trajectory_capacity is not None
+                    and current_trajectory_length + len(incremental_ids) >= self._trajectory_capacity
                 )
 
-            if not capacity_exhausted and merged_response_data is not None:
-                (
-                    buffer.response_ids,
-                    buffer.response_mask,
-                    buffer.response_logprobs,
-                ) = merged_response_data
+            if not capacity_exhausted:
+                buffer.response_ids.extend(incremental_ids)
+                buffer.response_mask.extend([0] * len(incremental_ids))
+                if sampling_params.get("logprobs", False):
+                    buffer.response_logprobs.extend([0.0] * len(incremental_ids))
                 self._assert_response_logprob_alignment(buffer)
                 if new_image_data:
                     if image_data is None:
