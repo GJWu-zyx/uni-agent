@@ -298,6 +298,59 @@ async def test_last_assistant_rollback_reencodes_replacement_suffix_as_masked_co
 
 
 @pytest.mark.asyncio
+async def test_last_assistant_rollback_reencodes_assistant_tool_suffix_after_generation_prompt():
+    """Continue the cached assistant prompt when a replacement suffix starts with assistant."""
+    session = _session(
+        "rollback-assistant-tool",
+        sampling_params={"logprobs": True},
+        enable_last_assistant_rollback=True,
+    )
+    tools = [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}]
+    first_messages = [{"role": "user", "content": "find docs"}]
+    replacement_assistant = {
+        "role": "assistant",
+        "content": "replacement",
+        "tool_calls": [
+            {
+                "id": "call_replacement",
+                "type": "function",
+                "function": {"name": "search", "arguments": {"query": "docs"}},
+            }
+        ],
+    }
+    replacement_messages = [
+        *first_messages,
+        replacement_assistant,
+        {
+            "role": "tool",
+            "tool_call_id": "call_replacement",
+            "content": "result",
+        },
+    ]
+    backend = SequencedBackend(["abandoned", "final"])
+
+    await _run(session, backend, first_messages, tools=tools)
+    await _run(session, backend, replacement_messages, tools=tools)
+
+    expected_context = FakeTokenizer().apply_chat_template(
+        replacement_messages,
+        tools=tools,
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+    assert backend.calls[1]["prompt_ids"] == expected_context
+    assert "assistant:assistant:" not in FakeTokenizer().decode(expected_context)
+
+    state = session.snapshot_state()
+    assert state["rollback_count"] == 1
+    [chain] = session.active_chains
+    expected_suffix = "replacement\ntool:result\nassistant:"
+    assert _decode_response_ids(chain.buffer.response_ids) == expected_suffix + "final"
+    assert chain.buffer.response_mask == [0] * len(expected_suffix) + [1] * len("final")
+    assert chain.buffer.response_logprobs == [0.0] * len(expected_suffix) + [-0.1] * len("final")
+
+
+@pytest.mark.asyncio
 async def test_last_assistant_rollback_does_not_materialize_suffix_beyond_total_capacity():
     """Close the rolled-back prefix without storing an oversized replacement suffix."""
     first_messages = [{"role": "user", "content": "run mini-swe"}]

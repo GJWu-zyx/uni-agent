@@ -448,7 +448,7 @@ class GatewaySession:
             if not capacity_exhausted:
                 buffer.response_ids.extend(incremental_ids)
                 buffer.response_mask.extend([0] * len(incremental_ids))
-                if sampling_params.get("logprobs", False):
+                if buffer.response_logprobs or sampling_params.get("logprobs", False):
                     buffer.response_logprobs.extend([0.0] * len(incremental_ids))
                 self._assert_response_logprob_alignment(buffer)
                 if new_image_data:
