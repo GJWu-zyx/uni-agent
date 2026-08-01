@@ -230,26 +230,16 @@ class MessageCodec:
         video_data: list[Any] | None = None,
     ) -> list[int]:
         """Encode a full chat history into prompt token IDs."""
-        if self._processor is not None:
-            raw_prompt = _apply_chat_template(
-                self._processor,
-                messages,
-                tools=tools,
-                add_generation_prompt=True,
-                tokenize=False,
-                **self._apply_chat_template_kwargs,
-            )
-            return self._encode_prompt_text(raw_prompt, image_data, video_data)
-
-        return normalize_token_ids(
-            _apply_chat_template(
-                self._tokenizer,
-                messages,
-                tools=tools,
-                add_generation_prompt=True,
-                **self._apply_chat_template_kwargs,
-            )
+        processing_class = self._processor if self._processor is not None else self._tokenizer
+        raw_prompt = _apply_chat_template(
+            processing_class,
+            messages,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=False,
+            **self._apply_chat_template_kwargs,
         )
+        return self._encode_prompt_text(raw_prompt, image_data, video_data)
 
     def encode_incremental(
         self,
