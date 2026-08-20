@@ -136,6 +136,17 @@ class OpenAICompatibleChatModel:
             for tool_call in (response_message.get("tool_calls") or [])
         ]
 
+        # Safety net: verl 现在通过 rollout.engine_kwargs.vllm.* 开启了
+        # --enable-auto-tool-choice + --tool-call-parser qwen3_xml，vLLM 会直接把
+        # Qwen3 的 <tool_call> XML 解析成结构化 tool_calls（主路径）。
+        # 以下兜底仅在 vLLM 解析未生效/失败时保险触发，正常情况不会走到。
+        if not serialized_tool_calls and "<tool_call>" in response_content:
+            logger.warning(
+                "no structured tool_calls from server but content contains <tool_call>; "
+                "falling back to XML parse (check enable_auto_tool_choice/tool_call_parser)"
+            )
+            response_content, serialized_tool_calls = self._parse_xml_tool_calls(response_content)
+
         usage = data.get("usage") or {}
         generation_info = {
             "prompt_tokens": usage.get("prompt_tokens", 0),
@@ -143,6 +154,47 @@ class OpenAICompatibleChatModel:
             "finish_reason": data["choices"][0].get("finish_reason"),
         }
         return response_content, serialized_tool_calls, generation_info
+
+    @staticmethod
+    def _parse_xml_tool_calls(content: str) -> tuple[str, list[dict]]:
+        """Extract Qwen-style ``<tool_call>...</tool_call>`` blocks from text.
+
+        Returns ``(remaining_text, tool_calls)`` where each tool call is in the
+        OpenAI ``{"id", "type", "function": {"name", "arguments"}}`` shape. The
+        matched blocks are stripped from the returned text; anything else (e.g. a
+        THOUGHT prefix) is preserved so the transcript stays faithful.
+        """
+        import json
+        import re
+
+        tool_calls: list[dict] = []
+        pattern = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+        for index, match in enumerate(pattern.finditer(content)):
+            payload = match.group(1).strip()
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                logger.warning("skipping malformed <tool_call> block: %r", payload)
+                continue
+            name = parsed.get("name", "")
+            arguments = parsed.get("arguments", {})
+            if not isinstance(arguments, (dict, str)):
+                arguments = json.dumps(arguments)
+            tool_calls.append(
+                {
+                    "id": f"call_xml_{index}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            )
+        remaining = pattern.sub("", content).strip()
+        if tool_calls:
+            logger.info(
+                "parsed %d <tool_call> XML block(s) from text: %s",
+                len(tool_calls),
+                [tc["function"]["name"] for tc in tool_calls],
+            )
+        return remaining, tool_calls
 
     async def _post_chat_completion(self, body: dict[str, Any]) -> dict[str, Any]:
         """POST ``body`` to ``/chat/completions``, retrying transient failures.

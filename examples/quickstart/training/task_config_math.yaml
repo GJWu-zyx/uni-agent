@@ -1,0 +1,18 @@
+- name: math
+  sandbox:
+    provider: local
+    runtime_timeout: 300
+  agent:
+    name: react
+    max_steps: 5
+    tools:
+      - name: stateful_shell
+        command_timeout: 60
+        env_vars:
+          PAGER: "cat"
+          TQDM_DISABLE: "1"
+      - name: str_replace_editor
+    model:
+      temperature: 0.0
+      top_p: 1.0
+      max_total_tokens: 4096

@@ -253,7 +253,9 @@ class Toolbox:
         for entry in specs:
             if not isinstance(entry, dict) or not entry.get("name"):
                 raise ValueError(f"each tools entry must be a mapping with a 'name': {entry!r}")
-            kwargs = {k: v for k, v in entry.items() if k != "name"}
+            # Drop attribute-style default fields (e.g. ``command_timeout: None``) that
+            # serialized Task Configs may carry for tools which don't accept kwargs.
+            kwargs = {k: v for k, v in entry.items() if k != "name" and v is not None}
             tools.append(get_tool(entry["name"], sandbox, **kwargs))
         return cls(tools)
 

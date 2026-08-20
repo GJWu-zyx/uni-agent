@@ -13,8 +13,12 @@ exec. Providers with ``supports_shell`` skip tmux entirely.
 from __future__ import annotations
 
 import asyncio
+import ast
 import dataclasses
 import logging
+import math
+import operator
+import os
 import re
 import shlex
 import time
@@ -27,6 +31,60 @@ from uni_agent.sandbox import Sandbox, SandboxBackend
 from .base import Tool, ToolError, ToolResult, register_tool
 
 logger = logging.getLogger(__name__)
+
+#: A command that is "just math": digits, operators (incl. ^ / % / sqrt) and
+#: whitespace only. A tiny policy often echoes the bare expression (e.g. ``3*7``)
+#: which is not a valid bash command, so we evaluate it directly instead.
+_ARITHMETIC_RE = re.compile(r"^[\d+\-*/%^().,\s]*$")
+_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_UNARY_OPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+
+def _eval_math(command: str) -> str | None:
+    """Evaluate a bare arithmetic expression (``3*7``, ``sqrt(16)``, ``2^3`` ...).
+
+    Returns the formatted result as a string, or ``None`` when ``command`` is not
+    pure math (in which case the caller runs it as a real shell command). ``^`` is
+    treated as exponentiation (the common math-solver reading) and evaluation is
+    restricted to arithmetic AST nodes so arbitrary code can't run.
+    """
+    expr = command.strip()
+    # Fast path: only math-ish characters (digits / operators / spaces / sqrt).
+    # ``sqrt`` is the only allowed word, so strip it and require the rest to be pure.
+    if not expr or not _ARITHMETIC_RE.fullmatch(expr.replace("sqrt", "")):
+        return None
+    # bash ``^`` is bitwise-xor; math solvers mean power.
+    py_expr = expr.replace("^", "**")
+    try:
+        tree = ast.parse(py_expr, mode="eval")
+        value = _ast_eval(tree.body)
+    except Exception:
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return str(value)
+
+
+def _ast_eval(node: ast.AST) -> Any:
+    """Evaluate an arithmetic-only AST node (no names/attrs/calls/subscripts)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
+        return _BIN_OPS[type(node.op)](_ast_eval(node.left), _ast_eval(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
+        return _UNARY_OPS[type(node.op)](_ast_eval(node.operand))
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        if node.func.id == "sqrt" and len(node.args) == 1:
+            return math.sqrt(_ast_eval(node.args[0]))
+    raise ValueError(f"unsupported arithmetic node: {type(node).__name__}")
 
 
 @dataclasses.dataclass
@@ -180,7 +238,7 @@ class TmuxShell:
         self.height = height
         self._shell = shell
         self._env = dict(env or {})
-        self._dir = f"/tmp/uni-agent-shell/{self.session_id}"
+        self._dir = f"/tmp/uni-agent-shell-{os.environ.get('USER', 'unknown')}/{self.session_id}"
         self._sock = f"{self._dir}/tmux.sock"
         self._counter = 0
 
@@ -449,6 +507,15 @@ class ShellTool(Tool):
         command = args.get("command")
         if not command or not str(command).strip():
             raise ToolError("Parameter `command` is required for shell.")
+
+        # Bare arithmetic (e.g. ``3*7``) is not a valid bash command. Tiny policies
+        # (smoke-test models) often emit exactly that, so evaluate it directly.
+        math_result = _eval_math(str(command))
+        if math_result is not None:
+            return ToolResult(
+                text=_format(stdout=math_result + "\n", stderr="", exit_code=0),
+                status="ok",
+            )
 
         command_timeout = timeout if timeout is not None else self.config.command_timeout
         shell = await self._ensure_shell()
